@@ -1,3 +1,7 @@
+# 换行规范：文本文件统一以 LF 存入仓库，检出时按平台还原，
+# 避免 Windows(autocrlf) 下出现大量仅行尾差异的"伪修改"。
+* text=auto
+
 # GitHub 语言统计修正：第三方资源与上游技能包不计入本仓库语言占比。
 # 修正前仓库被识别为 Python（两个 513KB 的 review_engine.py 副本贡献 1.25MB），
 # 导致 language:JavaScript 等筛选入口找不到本仓库。

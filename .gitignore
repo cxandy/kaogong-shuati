@@ -52,6 +52,8 @@ ai-config.db
 # ===== 本地工具状态 / 数据目录（不上传）=====
 .workbuddy/
 .zcode/
+linfeng-temp/
+zzcc-temp/
 parsed/
 pdf-src/
 pdf-work/
@@ -64,6 +66,7 @@ skills/.redskill-*
 skills/**/.redskill-installed
 
 # ===== 爬虫与数据采集脚本（仅本地保留，不随仓库分发）=====
+kg-convert.mjs
 crawl.js
 crawl-all.js
 crawl-syzc.mjs
