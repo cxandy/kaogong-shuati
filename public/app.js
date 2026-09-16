@@ -83,17 +83,28 @@ const el = (tag, cls, html) => {
   return e;
 };
 
-const api = async (path, opts) => {
+const api = async (path, opts = {}) => {
   // 本地模式（无服务器）：window.__LOCAL_API_PROMISE__ 由 local-bootstrap.js 设置，
   // 就绪后所有请求走本地路由（IndexedDB + sql.js 题库 + AI 直调）
   if (window.__LOCAL_API_PROMISE__) {
     const handler = await window.__LOCAL_API_PROMISE__;
     return handler(path, opts);
   }
+  // 远程模式：AI 配置类接口自动携带管理员口令（localStorage，供服务器 ADMIN_KEY 校验）
+  if (/^\/api\/ai\/(agents|explain-cache|models-proxy)/.test(path)) {
+    const adminKey = localStorage.getItem('kg_admin_key');
+    if (adminKey) {
+      opts = { ...opts, headers: { ...(opts.headers || {}), 'x-admin-key': adminKey } };
+    }
+  }
   const res = await fetch(path, opts);
   if (!res.ok) {
     let msg = `请求失败 (${res.status})`;
     try { msg = (await res.json()).error || msg; } catch {}
+    if (res.status === 401) {
+      localStorage.removeItem('kg_admin_key'); // 口令失效/错误 → 清掉，让设置页重输
+      msg = '管理员口令错误：' + msg;
+    }
     throw new Error(msg);
   }
   return res.json();
@@ -376,7 +387,7 @@ function showAnswerFeedback(q, j, selected) {
       <span class="cmp-item"><i class="cmp-dot mine"></i>我的答案 <b>${selected.map((x) => LETTERS[x]).join('') || '—'}</b></span>
       <span class="cmp-item"><i class="cmp-dot right"></i>正确答案 <b>${j.correct.map((x) => LETTERS[x]).join('') || '见解析'}</b></span>
     </div>
-    ${q.analysis ? `<div class="ab-body" style="margin:0 0 10px">${esc(q.analysis)}</div>` : ''}
+    ${q.analysis ? `<div class="ab-body" style="margin:0 0 10px">${renderAnalysis(q.analysis)}</div>` : ''}
     <div class="action-row" style="margin-bottom:6px">
       <button class="btn btn-ghost ${store.notes.has(String(fbqid)) ? 'on' : ''}" data-note-btn="${String(fbqid)}" id="btn-note-fb">${ico('pen', 14)} ${noteBtnLabel(fbqid)}</button>
       <button class="btn btn-ghost" id="btn-ai-explain-fb">${ico('sparkles', 15)} AI 解析本题（考点/错项/技巧）</button>
@@ -1716,7 +1727,7 @@ function previewCardHtml(q, i) {
         const p = customOptionParts(o, oi);
         return `<div class="pv-opt${ansLetters.has(p.letter) ? ' ok' : ''}"><span class="pv-opt-letter">${p.letter || '•'}</span><span>${esc(customOptionDisplayText(p.text))}</span></div>`;
       }).join('')}</div>` : ''}
-      ${q.analysis ? `<details class="pv-details"><summary>解析</summary><div class="pv-fold">${esc(q.analysis)}</div></details>` : '<div class="pv-no-fold">无解析</div>'}
+      ${q.analysis ? `<details class="pv-details"><summary>解析</summary><div class="pv-fold">${renderAnalysis(q.analysis)}</div></details>` : '<div class="pv-no-fold">无解析</div>'}
     </div>`;
 }
 
@@ -1932,7 +1943,7 @@ function customQuestionDetail(q, batchName) {
     </div>
     <div class="qd-block">
       <div class="qd-label">解析</div>
-      <div class="qd-content">${q.analysis ? esc(q.analysis) : '<span class="muted">无解析</span>'}</div>
+      <div class="qd-content">${q.analysis ? renderAnalysis(q.analysis) : '<span class="muted">无解析</span>'}</div>
     </div>
     <div class="sheet-actions">
       <button class="btn btn-primary" id="qd-edit" style="flex:0 0 auto">${ico('pen', 15)} 编辑</button>
@@ -2652,6 +2663,13 @@ function fixImgLoading(html) {
     .replace(/<img\s/gi, '<img referrerpolicy="no-referrer" ')
     .replace(/src=["']\/\//gi, 'src="https://');
 }
+// 解析内容渲染：含标签时按富文本（sanitize + 防裂图），否则纯文本
+function renderAnalysis(s) {
+  const v = String(s ?? '');
+  if (!v) return '';
+  if (/<[a-z][^>]*>/i.test(v)) return sanitizeHtml(fixImgLoading(v));
+  return esc(v);
+}
 
 // ========== 图片放大查看器（材料/题干宽表格图、公式图点开可捏合缩放） ==========
 // 解决资料分析"材料太大看不清"：宽表格图不再靠横向滚动，点开全屏后双指缩放/拖动读数字。
@@ -3140,7 +3158,7 @@ function renderQuestion() {
       box.id = 'inline-explain';
       box.innerHTML = `
         <div class="ab-title">${ico('book', 16)} 解析</div>
-        ${q.analysis ? `<div class="ab-body" style="margin:0 0 10px">${esc(q.analysis)}</div>` : '<div class="ab-body" style="margin:0 0 10px;color:var(--muted)">本题暂无官方解析，可用上方「AI 批改」获取评分与讲解。</div>'}
+        ${q.analysis ? `<div class="ab-body" style="margin:0 0 10px">${renderAnalysis(q.analysis)}</div>` : '<div class="ab-body" style="margin:0 0 10px;color:var(--muted)">本题暂无官方解析，可用上方「AI 批改」获取评分与讲解。</div>'}
         <button class="btn btn-ghost btn-block" style="margin-bottom:6px" id="btn-ai-explain">${ico('sparkles', 15)} AI 解析本题（解析考点/错项/技巧）</button>
         <div id="ai-explain-result" style="display:none"></div>
       `;
@@ -3284,7 +3302,7 @@ function renderQuestion() {
         <span class="cmp-item"><i class="cmp-dot mine"></i>我的答案 <b>${mySel || '—'}</b></span>
         <span class="cmp-item"><i class="cmp-dot right"></i>正确答案 <b>${rightSel}</b></span>
       </div>
-      ${q.analysis ? `<div class="ab-body" style="margin:0 0 10px">${esc(q.analysis)}</div>` : ''}
+      ${q.analysis ? `<div class="ab-body" style="margin:0 0 10px">${renderAnalysis(q.analysis)}</div>` : ''}
       <button class="btn btn-ghost btn-block" style="margin-bottom:6px" id="btn-ai-explain">${ico('sparkles', 15)} AI 解析本题（考点/错项/技巧）</button>
       <div id="ai-explain-result" style="display:none"></div>
     `;
@@ -3369,7 +3387,7 @@ function submitAnswer(q, selected, optWrap, opts, isMulti) {
     view.insertBefore(banner, actions);
     // 解析框：答案对照 + AI 解析按钮
     const box = el('div', 'answer-box');
-    box.innerHTML = `<div class="ab-title">${ico('book', 16)} 解析</div>${q.analysis ? `<div class="ab-body" style="margin:8px 0">${esc(q.analysis)}</div>` : ''}${r.correctText?.length ? '正确答案内容：' + r.correctText.map((t) => esc(t)).join(' | ') : ''}
+    box.innerHTML = `<div class="ab-title">${ico('book', 16)} 解析</div>${q.analysis ? `<div class="ab-body" style="margin:8px 0">${renderAnalysis(q.analysis)}</div>` : ''}${r.correctText?.length ? '正确答案内容：' + r.correctText.map((t) => esc(t)).join(' | ') : ''}
       <button class="btn btn-ghost btn-block" style="margin-top:10px" id="btn-ai-explain">${ico('sparkles', 15)} AI 解析本题（解析考点/错项/技巧）</button>
       <div id="ai-explain-result" style="margin-top:8px;display:none"></div>`;
     view.insertBefore(box, actions);
@@ -3553,7 +3571,7 @@ function renderReview() {
     if (q.analysis) {
       const oa = el('div', 'answer-box');
       oa.style.marginTop = '10px';
-      oa.innerHTML = `<div class="ab-title">${ico('book', 16)} 解析</div><div class="ab-body">${esc(q.analysis)}</div>`;
+      oa.innerHTML = `<div class="ab-title">${ico('book', 16)} 解析</div><div class="ab-body">${renderAnalysis(q.analysis)}</div>`;
       card.appendChild(oa);
     }
     const rowBtns = el('div', 'action-row');
@@ -4955,13 +4973,38 @@ async function renderAiSettings() {
   [...document.querySelectorAll('#topbar-right > *:not(#btn-theme)')].forEach(n => n.remove());
   const view = $('#view');
   view.innerHTML = '<div class="spinner"></div>';
-  let agents, skills = [], skillsErr = false;
+  const isRemote = !window.__LOCAL_API_PROMISE__;
+  // 管理员口令栏（仅远程模式需要；本地模式 AI 直调本机，无需口令）
+  if (isRemote) {
+    view.innerHTML = '';
+    const keyBar = el('div', 'card', `
+      <h3>${ico('key', 16)} 管理员口令</h3>
+      <div class="li-sub">远程模式下，AI 配置/清缓存/模型代理接口需服务器管理员口令（服务器 env 的 ADMIN_KEY）。口令只保存在本机浏览器。</div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input class="field" type="password" id="ai-admin-key" placeholder="输入管理员口令" value="${esc(localStorage.getItem('kg_admin_key') || '')}" style="flex:1">
+        <button class="btn" id="ai-admin-save">${ico('lock', 14)} 保存</button>
+      </div>
+      <div class="li-sub" id="ai-admin-hint" style="color:var(--warn,#c60);margin-top:6px"></div>
+    `);
+    view.appendChild(keyBar);
+    keyBar.querySelector('#ai-admin-save').onclick = () => {
+      const k = (keyBar.querySelector('#ai-admin-key').value || '').trim();
+      if (k) localStorage.setItem('kg_admin_key', k); else localStorage.removeItem('kg_admin_key');
+      renderAiSettings();
+    };
+  }
+  let agents = null, skills = [], skillsErr = false;
   try {
     [agents, skills] = await Promise.all([
       api('/api/ai/agents'),
       api('/api/skills').catch((e) => { skillsErr = true; return []; }),
     ]);
   } catch (e) {
+    if (isRemote) {
+      const hint = view.querySelector('#ai-admin-hint');
+      if (hint) hint.textContent = /401|口令/.test(e.message) ? '口令错误或未设置：请在本栏输入服务器 ADMIN_KEY 后点「保存」再试' : e.message;
+      return;
+    }
     view.innerHTML = `<div class="empty">加载失败：${e.message}</div>`;
     return;
   }

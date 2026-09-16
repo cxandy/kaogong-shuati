@@ -20,7 +20,11 @@ import { customQuestionHtml, parseImages } from './public/lib/custom-parser.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] || process.env.PORT || 3000);
+// AI 管理接口口令（经 X-Admin-Key 请求头校验）；未设置时兼容旧行为（不鉴权）
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const DB_FILE = path.join(__dirname, 'tiku.db');
+// KG Obsidian 笔记库图片目录（kg-convert.mjs 把笔记内 90-图片 相对路径改写为 /kg-img/，由本路由服务）
+const KG_IMG_DIR = path.resolve(process.env.KG_IMG_DIR || 'C:\\Users\\Rose\\KG\\90-图片');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const outDir = path.join(__dirname, 'out');
 
@@ -158,6 +162,12 @@ const json = (res, code, data) => {
   res.end(JSON.stringify(data));
 };
 const err = (res, code, msg) => json(res, code, { error: msg });
+// AI 管理接口鉴权：ADMIN_KEY 已设置则要求 X-Admin-Key 匹配；未设置保持开放（向前兼容）
+const adminOk = (req) => {
+  if (!ADMIN_KEY) return true;
+  const h = req.headers['x-admin-key'];
+  return typeof h === 'string' && h.length > 0 && h === ADMIN_KEY;
+};
 
 /** 多模态识图调用（OpenAI 兼容 image_url 格式，用于 GLM-4.1V-Thinking-Flash / GLM-4V-Flash 等视觉模型）
  *  含 429 限流自动重试（免费视觉模型常见访问量过大）
@@ -215,7 +225,8 @@ async function callVision(apiKey, baseUrl, model, imgs, mode = 'describe') {
       const d = await r.json().catch(() => null);
       if (!d) return { error: `识图 API 返回异常：状态 200 但响应体不是有效 JSON（网关异常）` };
       const c = d.choices?.[0]?.message?.content;
-      if (c) return { content: c };
+      // 部分视觉模型（GLM-4.5V 等）会在内容里夹带 <|begin_of_box|>/<|end_of_box|>/<|assistant|> 控制符，清理掉
+      if (c) return { content: c.replace(/<\|[a-z_]*\|>/g, '').trim() };
       // 推理模型思维链吃光 max_tokens 的典型表现：finish_reason=length 且只有 reasoning_content
       const reason = d.choices?.[0]?.finish_reason;
       const hasReasoning = !!d.choices?.[0]?.message?.reasoning;
@@ -238,10 +249,30 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
   '.wasm': 'application/wasm',
 };
+
+/**
+ * 把 /kg-img/... 相对路径解析为 KG_IMG_DIR 下的本地图片文件，
+ * 返回 AI 识图可用的 data 负载（mime/base64）；非 /kg-img 或文件缺失/过大返回 null。
+ */
+function kgImgLocal(u) {
+  const s = String(u || '');
+  if (!s.startsWith('/kg-img/')) return null;
+  const rel = s.slice('/kg-img/'.length).split(/[?#]/)[0];
+  const abs = path.join(KG_IMG_DIR, rel);
+  if (!abs.startsWith(KG_IMG_DIR) || !fs.existsSync(abs)) return null;
+  const st = fs.statSync(abs);
+  if (!st.isFile() || st.size <= 0 || st.size > 5 * 1024 * 1024) return null;
+  const mime = MIME[path.extname(abs).toLowerCase()] || 'image/png';
+  return { url: s, mime, b64: fs.readFileSync(abs).toString('base64'), size: st.size };
+}
 
 /** 判分：选项索引 → 是否正确（与前端 judge 逻辑对齐） */
 // node:sqlite 无 transaction()，手工事务包装
@@ -1286,33 +1317,31 @@ const server = http.createServer(async (req, res) => {
   if (pathname.startsWith('/api/')) {
     try {
       // 科目列表（questions = 唯一题目数，跨卷重复题去重；done = 该科目答对且去重的已做题目数）
-      if (pathname === '/api/subjects' && req.method === 'GET') {
-        if (!chapterCache.has('subjects|static')) {
-          chapterCache.set('subjects|static', pdb.prepare(`
-            SELECT tp.subjectName,
-                   COUNT(DISTINCT tp.id) AS papers,
-                   COUNT(DISTINCT tq.questionId) AS questions
-            FROM tiku.papers tp
-            LEFT JOIN tiku.questions tq ON tq.paperId = tp.id
-            WHERE substr(tp.name, 1, 4) BETWEEN '${YEAR_FROM}' AND '${YEAR_TO}'
-            GROUP BY tp.subjectName
-          `).all());
-        }
-        const staticRows = chapterCache.get('subjects|static');
-        // 综应只保留 A 类：主界面题目数按分类树口径（question_categories），与专项练习一致
-        const zongyingN = pdb.prepare(`SELECT COUNT(DISTINCT qc.question_id) AS n FROM question_categories qc
-          JOIN tiku.questions q ON q.questionId = qc.question_id
-          JOIN tiku.papers p ON p.id = q.paperId AND substr(p.name, 1, 4) BETWEEN '${YEAR_FROM}' AND '${YEAR_TO}'
-          WHERE qc.subject = '事业编·综应'`).get().n;
-        // 动态部分：已做对的去重题数（随做题记录变化，不缓存；subject 以题库为准）
-        const doneRows = pdb.prepare(`
-          SELECT tp.subjectName, COUNT(DISTINCT r.question_id) AS done
-          FROM tiku.papers tp
-          JOIN tiku.questions tq ON tq.paperId = tp.id
-          JOIN practice_records r ON r.question_id = tq.questionId AND r.is_correct = 1
-          WHERE substr(tp.name, 1, 4) BETWEEN '${YEAR_FROM}' AND '${YEAR_TO}'
-          GROUP BY tp.subjectName
-        `).all();
+if (pathname === '/api/subjects' && req.method === 'GET') {
+         if (!chapterCache.has('subjects|static')) {
+           chapterCache.set('subjects|static', pdb.prepare(`
+             SELECT tp.subjectName,
+                    COUNT(DISTINCT tp.id) AS papers,
+                    COUNT(DISTINCT tq.questionId) AS questions
+             FROM tiku.papers tp
+             LEFT JOIN tiku.questions tq ON tq.paperId = tp.id
+             GROUP BY tp.subjectName
+           `).all());
+         }
+         const staticRows = chapterCache.get('subjects|static');
+         // 综应只保留 A 类：主界面题目数按分类树口径（question_categories），与专项练习一致
+         const zongyingN = pdb.prepare(`SELECT COUNT(DISTINCT qc.question_id) AS n FROM question_categories qc
+           JOIN tiku.questions q ON q.questionId = qc.question_id
+           JOIN tiku.papers p ON p.id = q.paperId
+           WHERE qc.subject = '事业编·综应'`).get().n;
+         // 动态部分：已做对的去重题数（随做题记录变化，不缓存；subject 以题库为准）
+         const doneRows = pdb.prepare(`
+           SELECT tp.subjectName, COUNT(DISTINCT r.question_id) AS done
+           FROM tiku.papers tp
+           JOIN tiku.questions tq ON tq.paperId = tp.id
+           JOIN practice_records r ON r.question_id = tq.questionId AND r.is_correct = 1
+           GROUP BY tp.subjectName
+         `).all();
         const doneMap = new Map(doneRows.map((r) => [r.subjectName, Number(r.done || 0)]));
         return json(res, 200, staticRows.map((r) => {
           const questions = r.subjectName === '事业编·综应' ? Number(zongyingN) : Number(r.questions);
@@ -1327,7 +1356,7 @@ const server = http.createServer(async (req, res) => {
         if (!chapterCache.has(catKey)) {
           // 综应只保留 A 类（用户要求）：过滤联考B/C/D类试卷分类
           const rows = db.prepare(
-            `SELECT p.category, COUNT(DISTINCT p.id) AS papers, COUNT(DISTINCT q.questionId) AS questions FROM papers p LEFT JOIN questions q ON q.paperId = p.id WHERE p.subjectName = ? AND substr(p.name, 1, 4) BETWEEN '${YEAR_FROM}' AND '${YEAR_TO}' GROUP BY p.category ORDER BY papers DESC, category`
+            `SELECT p.category, COUNT(DISTINCT p.id) AS papers, COUNT(DISTINCT q.questionId) AS questions FROM papers p LEFT JOIN questions q ON q.paperId = p.id WHERE p.subjectName = ? GROUP BY p.category ORDER BY papers DESC, category`
           ).all(subject);
           const filtered = subject === '事业编·综应' ? rows.filter((r) => !['联考B类', '联考C类', '联考D类'].includes(r.category)) : rows;
           chapterCache.set(catKey, filtered);
@@ -2253,6 +2282,10 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, rows);
       }
       // ---- AI 智能体配置 ----
+      // 配置类接口统一鉴权（列表/单条/更新/清缓存/模型代理）；AI 使用类接口（explain/ocr/structure/grade/material）保持开放
+      if ((pathname === '/api/ai/agents' || pathname.match(/^\/api\/ai\/agents\/\d+$/) || pathname === '/api/ai/explain-cache' || pathname === '/api/ai/models-proxy') && !adminOk(req)) {
+        return err(res, 401, '管理员口令错误或未提供：请在 AI 设置页顶部输入服务器 ADMIN_KEY');
+      }
       // 列表（key 脱敏）
       if (pathname === '/api/ai/agents' && req.method === 'GET') {
         return json(res, 200, listAgents(true));
@@ -2482,7 +2515,7 @@ const server = http.createServer(async (req, res) => {
               let mim;
               while ((mim = mimgRe.exec(mt.content)) !== null) {
                 const mu = normImgUrl(mim[1]);
-                if (/^https?:\/\//i.test(mu)) materialImgUrls.push(mu);
+                if (/^https?:\/\//i.test(mu) || mu.startsWith('/kg-img/')) materialImgUrls.push(mu);
               }
               materialText = mt.content
                 .replace(/<br\s*\/?>/gi, '\n')
@@ -2513,6 +2546,8 @@ const server = http.createServer(async (req, res) => {
         if (hasImage) {
           const downloads = await Promise.all(imgUrls.slice(0, 4).map(async (u) => {
             try {
+              const loc = kgImgLocal(u);
+              if (loc) return loc;
               if (!/^https?:\/\//i.test(u)) return null;
               const ctrl = new AbortController();
               const t = setTimeout(() => ctrl.abort(), 10000);
@@ -2528,6 +2563,8 @@ const server = http.createServer(async (req, res) => {
           }));
           const matDownloads = await Promise.all(materialImgUrls.slice(0, 3).map(async (u) => {
             try {
+              const loc = kgImgLocal(u);
+              if (loc) return loc;
               if (!/^https?:\/\//i.test(u)) return null;
               const ctrl = new AbortController();
               const t = setTimeout(() => ctrl.abort(), 10000);
@@ -2773,6 +2810,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- 静态文件 ----
+  // KG 笔记库图片（/kg-img/题目图/xxx.png 等；converter 已把 ../../../90-图片/ 改写为 /kg-img/）
+  if (pathname.startsWith('/kg-img/')) {
+    const rel = pathname.slice('/kg-img/'.length);
+    const img = path.join(KG_IMG_DIR, rel);
+    if (!img.startsWith(KG_IMG_DIR)) return err(res, 403, '禁止访问');
+    if (!fs.existsSync(img) || fs.statSync(img).isDirectory()) return err(res, 404, '图片不存在');
+    const iext = path.extname(img).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[iext] || 'image/png', 'Cache-Control': 'public, max-age=86400' });
+    fs.createReadStream(img).pipe(res);
+    return;
+  }
   let file = path.join(PUBLIC_DIR, pathname === '/' ? 'index.html' : pathname);
   if (!file.startsWith(PUBLIC_DIR)) return err(res, 403, '禁止访问');
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(PUBLIC_DIR, 'index.html');
